@@ -1,0 +1,240 @@
+# 1. Installation & Imports
+!pip install ultralytics opencv-python-headless
+import cv2
+import numpy as np
+from ultralytics import YOLO
+from google.colab.patches import cv2_imshow
+from google.colab import files
+from IPython.display import HTML, display  # Added display for video output
+from base64 import b64encode
+# Note: This section installs packages and imports libraries for video processing, object detection, and display.
+
+# 2. Video Upload & Setup
+print("Upload your video file:")
+uploaded = files.upload()  # Prompts the user to upload a video file
+video_path = list(uploaded.keys())[0]
+cap = cv2.VideoCapture(video_path)
+# Video writer setup using uploaded video properties
+frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fps = cap.get(cv2.CAP_PROP_FPS) or 20.0
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+out = cv2.VideoWriter('output.mp4', fourcc, fps, (frame_width, frame_height))
+# Note: Sets up video capture and writer for processing frames.
+
+# 3. Configuration & Models
+model = YOLO('yolov8m.pt')  # Loads YOLO model (medium version)
+vehicle_classes = [2, 3, 5, 7, 9]  # Target vehicle classes (e.g., car, truck, etc.)
+conf_threshold = 0.3  # Confidence threshold for detections
+
+# Lane Detection Parameters
+CANNY_THRESHOLDS = (30, 150)  # Edge detection thresholds
+HOUGH_PARAMS = (30, 30, 100)  # Parameters for Hough Transform
+ROI_VERTICES = np.array([[
+    (0, frame_height),
+    (frame_width//2 - 300, int(frame_height*0.55)),
+    (frame_width//2 + 300, int(frame_height*0.55)),
+    (frame_width, frame_height)
+]], dtype=np.int32)
+# HSV color ranges for lane marking detection
+COLOR_RANGES = {
+    'white': (np.array([0, 0, 180]), np.array([179, 40, 255])),
+    'yellow': (np.array([15, 80, 100]), np.array([35, 255, 255]))
+}
+
+# Distance Estimation Constants
+REF_HEIGHT = 150      # Reference object height (pixels)
+KNOWN_DISTANCE = 10   # Known distance corresponding to REF_HEIGHT (meters)
+FOCAL_LENGTH = (frame_width * KNOWN_DISTANCE) / REF_HEIGHT
+# Note: Loads the detection model and sets constants for lane detection and vehicle distance estimation.
+
+# 4. Enhanced Lane Tracking Class
+class LaneTracker:
+    def __init__(self):
+        self.prev_left = None
+        self.prev_right = None
+        self.smooth_factor = 0.7  # For temporal smoothing
+        self.frame_count = 0
+
+    def detect_lanes(self, frame):
+        # Convert frame to HSV and create masks for white and yellow
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        white_lower, white_upper = COLOR_RANGES['white']
+        yellow_lower, yellow_upper = COLOR_RANGES['yellow']
+        white_mask = cv2.inRange(hsv, white_lower, white_upper)
+        yellow_mask = cv2.inRange(hsv, yellow_lower, yellow_upper)
+        combined_mask = cv2.bitwise_or(white_mask, yellow_mask)
+
+        # Edge detection pipeline
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        masked_gray = cv2.bitwise_and(gray, gray, mask=combined_mask)
+        blur = cv2.GaussianBlur(masked_gray, (9, 9), 0)
+        edges = cv2.Canny(blur, *CANNY_THRESHOLDS)
+
+        # Apply Region Of Interest (ROI) mask
+        roi_mask = np.zeros_like(edges)
+        cv2.fillPoly(roi_mask, ROI_VERTICES, 255)
+        masked_edges = cv2.bitwise_and(edges, roi_mask)
+
+        # Line detection using Hough Transform
+        lines = cv2.HoughLinesP(masked_edges, 1, np.pi/180, *HOUGH_PARAMS)
+        left_lines, right_lines = [], []
+        if lines is not None:
+            for line in lines:
+                x1, y1, x2, y2 = line[0]
+                dx, dy = x2 - x1, y2 - y1
+                if abs(dx) < 1e-5: continue
+                slope = dy / dx
+                length = np.sqrt(dx**2 + dy**2)
+                if slope < -0.2 and length > 50:  # Left lane
+                    left_lines.append(line[0])
+                elif slope > 0.2 and length > 50:  # Right lane
+                    right_lines.append(line[0])
+        # Average, smooth, and extrapolate lane lines
+        left_avg = self.average_lines(left_lines)
+        right_avg = self.average_lines(right_lines)
+        self.frame_count += 1
+        if self.frame_count % 30 == 0:
+            if left_avg is None: self.prev_left = None
+            if right_avg is None: self.prev_right = None
+        left_avg = self.apply_smoothing(left_avg, 'left')
+        right_avg = self.apply_smoothing(right_avg, 'right')
+        return self.extrapolate_lines(left_avg, right_avg, frame.shape)
+
+    def average_lines(self, lines):
+        if not lines: return None
+        x_centers = []
+        slopes = []
+        weights = []
+        for line in lines:
+            x1, y1, x2, y2 = line
+            length = np.sqrt((x2-x1)**2 + (y2-y1)**2)
+            dx = x2 - x1
+            dy = y2 - y1
+            if dx == 0: continue
+            slope = dy / dx
+            x_center = (x1 + x2) / 2
+            slopes.append(slope)
+            x_centers.append(x_center)
+            weights.append(length)
+        if not weights: return None
+        avg_slope = np.dot(slopes, weights) / sum(weights)
+        avg_x = np.dot(x_centers, weights) / sum(weights)
+        y1 = ROI_VERTICES[0][1][1]  # Top y-coordinate from ROI
+        y2 = frame_height         # Bottom y-coordinate
+        x1 = int(avg_x + (y1 - y2) / avg_slope)
+        x2 = int(avg_x + (y2 - y2) / avg_slope)
+        return [x1, y1, x2, y2]
+
+    def apply_smoothing(self, current, side):
+        prev = self.prev_left if side == 'left' else self.prev_right
+        if current is None:
+            return prev
+        if prev is None:
+            return current
+        return (self.smooth_factor * np.array(current) +
+                (1 - self.smooth_factor) * np.array(prev)).astype(int)
+
+    def extrapolate_lines(self, left, right, shape):
+        def make_line(line, y_top):
+            if line is None: return None
+            x1, y1, x2, y2 = line
+            if y1 == y2: return None
+            slope = (y2 - y1) / (x2 - x1 + 1e-5)
+            y_bottom = shape[0]
+            x_top = int(x1 + (y_top - y1) / slope)
+            x_bottom = int(x1 + (y_bottom - y1) / slope)
+            return [x_top, y_top, x_bottom, y_bottom]
+        y_top = ROI_VERTICES[0][1][1]
+        left_line = make_line(left, y_top)
+        right_line = make_line(right, y_top)
+        return [left_line, right_line]
+
+def draw_lanes(frame, lane_lines):
+    if lane_lines is None: return frame
+    left_line, right_line = lane_lines
+    if left_line is not None:
+        cv2.line(frame, (left_line[0], left_line[1]),
+                 (left_line[2], left_line[3]), (0, 165, 255), 4)
+    if right_line is not None:
+        cv2.line(frame, (right_line[0], right_line[1]),
+                 (right_line[2], right_line[3]), (0, 255, 0), 4)
+    if left_line and right_line:
+        center_top = (left_line[0] + right_line[0]) // 2
+        center_bottom = (left_line[2] + right_line[2]) // 2
+        cv2.line(frame, (center_top, left_line[1]),
+                 (center_bottom, left_line[3]), (255, 0, 0), 2)
+    return frame
+# Note: This class and helper functions handle lane detection by processing the frame,
+# applying color masking, edge detection, Hough transform, smoothing, and drawing the lanes.
+
+# Enhanced distance estimation with validation
+def estimate_distance(box_height):
+    if box_height <= 0 or FOCAL_LENGTH <= 0:
+        return float('inf')
+    return (KNOWN_DISTANCE * FOCAL_LENGTH) / box_height
+# Note: This function estimates distance based on the height of a detected vehicle's bounding box.
+
+
+# 5. Main Processing Loop
+lane_tracker = LaneTracker()
+frame_count = 0
+
+while cap.isOpened():
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    try:
+        # Lane Detection
+        lane_lines = lane_tracker.detect_lanes(frame)
+        frame = draw_lanes(frame, lane_lines)
+
+        # Vehicle Detection using YOLO
+        results = model(frame)
+        vehicle_info = []
+        if results and results[0].boxes is not None:
+            for box in results[0].boxes:
+                if box.conf < conf_threshold:
+                    continue
+                cls_id = int(box.cls[0])
+                if cls_id in vehicle_classes:
+                    x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().numpy())
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(frame.shape[1], x2), min(frame.shape[0], y2)
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+                    # Estimate distance and filter by range
+                    box_height = y2 - y1
+                    distance = estimate_distance(box_height)
+                    if distance < 50:  # Show vehicles within 50m
+                        vehicle_info.append(((x1, y1, x2, y2), distance, model.names[cls_id]))
+            # Draw bounding boxes and labels
+            for (x1, y1, x2, y2), distance, name in vehicle_info:
+                color = (0, 255, 0) if distance > 15 else (0, 0, 255)
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                label = f'{name} {distance:.1f}m'
+                cv2.putText(frame, label, (x1, y1-10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+        out.write(frame)
+        # Show a preview every 2 seconds
+        if frame_count % int(fps*2) == 0:
+            cv2_imshow(frame)
+    except Exception as e:
+        print(f"Error frame {frame_count}: {str(e)}")
+    frame_count += 1
+# Note: This loop reads frames, processes lane and vehicle detection, draws the results, and writes output.
+
+# 6. Cleanup & Output
+cap.release()
+out.release()
+cv2.destroyAllWindows()
+# Note: Releases video resources and closes any OpenCV windows.
+
+def display_video(video_path):
+    mp4 = open(video_path, 'rb').read()
+    data_url = "data:video/mp4;base64," + b64encode(mp4).decode()
+    return HTML(f'<video controls width="640"><source src="{data_url}" type="video/mp4"></video>')
+
+# FIX: Use the display() function to render the HTML video in Colab.
+display(display_video('output.mp4'))
